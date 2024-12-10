@@ -88,6 +88,8 @@ class YouTubeAnalyzer:
                         auto_transcript, 
                         whisper_transcript
                     )
+                    if transcript_result is None:
+                        raise Exception("Transcript analysis cancelled by user")
                     analysis_pbar.update(1)
 
                     analysis = self.analyzer.analyze_content(
@@ -95,6 +97,8 @@ class YouTubeAnalyzer:
                         transcript_result['text'],
                         viewer_profile
                     )
+                    if analysis is None:
+                        raise Exception("Content analysis cancelled by user")
                     analysis_pbar.update(1)
                 pbar.update(1)
                 pbar.set_description(f"Completed: {steps[2]}")

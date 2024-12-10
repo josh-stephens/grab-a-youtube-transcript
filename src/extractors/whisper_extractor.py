@@ -5,20 +5,25 @@ from tqdm import tqdm
 import time
 from datetime import datetime, timedelta
 import signal
+import whisperx
+import torch
 
 # Add the project root directory to Python path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from config import WHISPER_MODEL
+from config import WHISPER_MODEL, DEVICE
 
 class WhisperExtractor:
     def __init__(self):
         self.model = None
+        self.diarize_model = None
+        self._whisperx = None  # Add this to lazy load the entire module
+        self._torch = None
         self.ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
+                'preferredcodec': 'wav',
                 'preferredquality': '192',
             }],
             'quiet': True,
@@ -28,18 +33,34 @@ class WhisperExtractor:
         self.pbar = None
         self.cancelled = False
 
-    def _load_model(self):
-        """Lazy load the Whisper model when needed."""
+    def _load_dependencies(self):
+        """Lazy load all required modules only when needed"""
+        if self._whisperx is None:
+            print("\nLoading WhisperX dependencies...")
+            import whisperx
+            import torch
+            self._whisperx = whisperx
+            self._torch = torch
+
+    def _load_models(self):
+        """Lazy load the WhisperX models when needed."""
         if self.model is None:
-            print("\nLoading Whisper model...")
-            # Temporarily redirect stderr to suppress the FutureWarning
-            stderr = sys.stderr
-            sys.stderr = open(os.devnull, 'w')
+            self._load_dependencies()
+            print("\nLoading WhisperX models...")
             try:
-                import whisper
-                self.model = whisper.load_model(WHISPER_MODEL)
-            finally:
-                sys.stderr = stderr
+                self.model = self._whisperx.load_model(
+                    WHISPER_MODEL,
+                    device=DEVICE,
+                    compute_type="float16"
+                )
+                
+                self.diarize_model = self._whisperx.DiarizationPipeline(
+                    use_auth_token=None,
+                    device=DEVICE
+                )
+            except Exception as e:
+                print(f"Error loading models: {str(e)}")
+                raise
 
     def _download_progress_hook(self, d):
         if d['status'] == 'downloading':
@@ -90,8 +111,8 @@ class WhisperExtractor:
                 self.pbar = None
 
     def get_whisper_transcript(self, url):
-        """Get transcript using Whisper."""
-        self._load_model()  # Load model only when needed
+        """Get transcript using WhisperX."""
+        self._load_models()
         
         self.cancelled = False
         temp_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "temp_audio_files")
@@ -100,7 +121,6 @@ class WhisperExtractor:
         temp_audio = os.path.join(temp_dir, "temp_audio")
         actual_file = None
         
-        # Store original signal handler
         original_handler = signal.getsignal(signal.SIGINT)
         
         try:
@@ -110,69 +130,71 @@ class WhisperExtractor:
                 
             print(f"\nTranscribing audio file: {actual_file}")
             
-            # Initialize variables for progress tracking
-            start_time = time.time()
-            last_progress = 0
-            processing_rate = None
-            eta = None
-            
             def signal_handler(signum, frame):
                 self.cancelled = True
-                # Restore original handler for subsequent Ctrl+C
                 signal.signal(signal.SIGINT, original_handler)
-                print("\nCancelling Whisper transcription...")
+                print("\nCancelling WhisperX transcription...")
             
-            # Set up signal handler
             signal.signal(signal.SIGINT, signal_handler)
             
-            with tqdm(total=100, desc="Transcribing", unit="%", bar_format='{l_bar}{bar}| {n:.0f}%{postfix}') as pbar:
-                def progress_callback(progress):
-                    if self.cancelled:
-                        raise KeyboardInterrupt("Whisper transcription cancelled")
-                    
-                    nonlocal last_progress, processing_rate, eta, start_time
-                    
-                    current_time = time.time()
-                    elapsed = current_time - start_time
-                    progress_percent = int(progress * 100)
-                    
-                    # Calculate processing rate after 5% progress
-                    if progress > 0.05 and processing_rate is None:
-                        processing_rate = elapsed / progress
-                        estimated_total = processing_rate
-                        eta = start_time + estimated_total
-                        
-                    # Update ETA continuously after initial estimate
-                    if processing_rate is not None:
-                        remaining_time = (eta - current_time) if eta else None
-                        if remaining_time:
-                            eta_str = str(timedelta(seconds=int(remaining_time)))
-                            rate = f"{progress_percent/elapsed:.1f}%/s"
-                            pbar.set_postfix_str(f"ETA: {eta_str}, Rate: {rate}")
-                    
-                    # Update progress bar
-                    update_size = progress_percent - last_progress
-                    if update_size > 0:
-                        pbar.update(update_size)
-                        last_progress = progress_percent
+            with tqdm(total=4, desc="Processing", unit="step") as pbar:
+                # Transcribe with original whisper model
+                result = self.model.transcribe(actual_file, batch_size=16)
+                pbar.update(1)
                 
-                result = self.model.transcribe(
+                if self.cancelled:
+                    raise KeyboardInterrupt("WhisperX transcription cancelled")
+
+                # Align whisper output
+                result = whisperx.align(
+                    result["segments"],
+                    self.model,
                     actual_file,
-                    progress_callback=progress_callback
+                    DEVICE,
+                    return_char_alignments=False
                 )
-            
-            return result
+                pbar.update(1)
+                
+                if self.cancelled:
+                    raise KeyboardInterrupt("WhisperX transcription cancelled")
+
+                # Get speaker diarization
+                diarize_segments = self.diarize_model(actual_file)
+                pbar.update(1)
+                
+                if self.cancelled:
+                    raise KeyboardInterrupt("WhisperX transcription cancelled")
+
+                # Assign speaker labels
+                result = whisperx.assign_word_speakers(
+                    diarize_segments,
+                    result
+                )
+                pbar.update(1)
+
+                # Format the result
+                segments = []
+                for segment in result["segments"]:
+                    segments.append({
+                        'text': segment['text'],
+                        'start': segment['start'],
+                        'end': segment['end'],
+                        'speaker': segment.get('speaker', 'Unknown')
+                    })
+
+                return {
+                    'text': ' '.join(s['text'] for s in segments),
+                    'segments': segments
+                }
             
         except KeyboardInterrupt:
-            print("\nWhisper transcription cancelled")
+            print("\nWhisperX transcription cancelled")
             return None
         except Exception as e:
             print(f"Error in get_whisper_transcript: {str(e)}")
             return None
         finally:
-            # Restore original signal handler
             signal.signal(signal.SIGINT, original_handler)
-            # Cleanup
             try:
                 if actual_file and os.path.exists(actual_file):
                     os.remove(actual_file)
