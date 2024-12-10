@@ -1,0 +1,8 @@
+yt-dlp
+whisper-openai
+youtube-transcript-api
+python-dotenv
+openai
+sqlalchemy
+tqdm
+ffmpeg-python 

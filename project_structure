@@ -1,0 +1,18 @@
+youtube-analysis/
+├── .env
+├── requirements.txt
+├── config.py
+├── src/
+│   ├── __init__.py
+│   ├── extractors/
+│   │   ├── __init__.py
+│   │   ├── youtube_extractor.py
+│   │   └── whisper_extractor.py
+│   ├── analyzers/
+│   │   ├── __init__.py
+│   │   └── transcript_analyzer.py
+│   ├── formatters/
+│   │   ├── __init__.py
+│   │   └── markdown_formatter.py
+│   └── main.py
+└── README.md 
